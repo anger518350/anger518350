@@ -1,0 +1,201 @@
+import sqlite3
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext
+)
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# ID администраторов и пароль
+ADMIN_IDS = [5286063642]
+ADMIN_PASSWORD = "0776"
+
+# --- Инициализация базы данных ---
+def create_tables():
+    conn = sqlite3.connect('materials.db')
+    c = conn.cursor()
+    # Таблица категорий
+    c.execute('''CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL)''')
+    # Таблица подкатегорий
+    c.execute('''CREATE TABLE IF NOT EXISTS subcategories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category_id INTEGER NOT NULL,
+                    FOREIGN KEY(category_id) REFERENCES categories(id))''')
+    # Таблица материалов
+    c.execute('''CREATE TABLE IF NOT EXISTS materials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    file_type TEXT,
+                    file_id TEXT NOT NULL,
+                    description TEXT,
+                    subcategory_id INTEGER NOT NULL,
+                    FOREIGN KEY(subcategory_id) REFERENCES subcategories(id))''')
+    conn.commit()
+    conn.close()
+
+# ===================== Пользовательский интерфейс =====================
+
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Добро пожаловать! Выберите категорию:")
+    show_categories(update, context)
+
+
+def show_categories(update: Update, context: CallbackContext):
+    conn = sqlite3.connect('materials.db')
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM categories')
+    categories = c.fetchall()
+    conn.close()
+    if not categories:
+        update.message.reply_text("Категории отсутствуют. Обратитесь к администратору.")
+        return
+    keyboard = [[InlineKeyboardButton(cat[1], callback_data=f"category_{cat[0]}")] for cat in categories]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Выберите категорию:", reply_markup=reply_markup)
+
+
+def show_subcategories(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if query.data == "back_to_categories":
+        query.edit_message_text("Выберите категорию:")
+        show_categories(update, context)
+        return
+    category_id = query.data.split('_')[1]
+    context.user_data['category_id'] = category_id
+    conn = sqlite3.connect('materials.db')
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM subcategories WHERE category_id = ?', (category_id,))
+    subcats = c.fetchall()
+    conn.close()
+    if not subcats:
+        query.edit_message_text("В этой категории отсутствуют подкатегории.")
+        return
+    keyboard = [[InlineKeyboardButton(sc[1], callback_data=f"subcategory_{sc[0]}")] for sc in subcats]
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_categories")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    query.edit_message_text("Выберите подкатегорию:", reply_markup=reply_markup)
+
+
+def show_materials(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if query.data == "back_to_subcategories":
+        show_subcategories(update, context)
+        return
+    subcat_id = query.data.split('_')[1]
+    context.user_data['subcategory_id'] = subcat_id
+    conn = sqlite3.connect('materials.db')
+    c = conn.cursor()
+    c.execute(
+        'SELECT name, file_type, file_id, description FROM materials WHERE subcategory_id = ?',
+        (subcat_id,)
+    )
+    materials = c.fetchall()
+    conn.close()
+    if not materials:
+        query.edit_message_text("В подкатегории пока нет материалов.")
+        return
+    text = "Материалы:\n\n"
+    keyboard = []
+    for mat in materials:
+        text += f"📄 {mat[0]}\n📝 {mat[3] or 'Без описания'}\n\n"
+        keyboard.append([InlineKeyboardButton(mat[0], callback_data=f"get_{mat[1]}_{mat[2]}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_subcategories")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    query.edit_message_text(text=text, reply_markup=reply_markup)
+
+
+def handle_download_request(update: Update, context: CallbackContext):
+    query = update.callback_query
+    try:
+        _, file_type, file_id = query.data.split('_', 2)
+    except ValueError:
+        query.answer("Неверный запрос!")
+        return
+    chat_id = query.message.chat.id
+    if file_type == "document":
+        context.bot.send_document(chat_id=chat_id, document=file_id)
+    elif file_type == "photo":
+        context.bot.send_photo(chat_id=chat_id, photo=file_id)
+    elif file_type == "video":
+        context.bot.send_video(chat_id=chat_id, video=file_id)
+    query.answer("Отправлено!")
+
+# ===================== Административные функции =====================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# ...остальные админ функции остаются без изменений...
+
+# ===================== Обработка загрузки файлов =====================
+
+def handle_document_upload(update: Update, context: CallbackContext):
+    if context.user_data.get('admin_action') != 'material_file':
+        return
+    file_type, file_id = None, None
+    if update.message.document:
+        file_type = 'document'
+        file_id = update.message.document.file_id
+    elif update.message.photo:
+        file_type = 'photo'
+        file_id = update.message.photo[-1].file_id
+    elif update.message.video:
+        file_type = 'video'
+        file_id = update.message.video.file_id
+    else:
+        update.message.reply_text('Файл не распознан. Попробуйте снова.')
+        return
+    subcat_id = context.user_data.get('subcategory_id')
+    name = context.user_data.get('material_name')
+    description = context.user_data.get('material_desc')
+    conn = sqlite3.connect('materials.db')
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO materials (name, file_type, file_id, description, subcategory_id) VALUES (?, ?, ?, ?, ?)',
+        (name, file_type, file_id, description, subcat_id)
+    )
+    conn.commit()
+    conn.close()
+    update.message.reply_text('Материал успешно загружен.')
+    context.user_data.clear()
+
+# ===================== Запуск бота =====================
+
+def main():
+    create_tables()
+    updater = Updater("8029940673:AAEjVG8sEPsw4G7EROviyhcpQtjSfPkPDCU", use_context=True)
+    dp = updater.dispatcher
+
+    # Команды
+    dp.add_handler(CommandHandler('start', start))
+    dp.add_handler(CommandHandler('admin', show_admin_menu))
+    # CallbackQuery для inline кнопок
+    dp.add_handler(CallbackQueryHandler(button_handler))
+    # Текстовые сообщения для админ-операций
+    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=ADMIN_IDS), admin_text_handler))
+    # Загрузка файлов админом
+    dp.add_handler(MessageHandler(
+        (Filters.document | Filters.photo | Filters.video) &
+        Filters.user(user_id=ADMIN_IDS),
+        handle_document_upload
+    ))
+
+    # Запуск polling
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
