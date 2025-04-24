@@ -1,201 +1,181 @@
 import sqlite3
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    Updater,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    Filters,
-    CallbackContext
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
 )
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
 
-# ID администраторов и пароль
-ADMIN_IDS = [5286063642]
-ADMIN_PASSWORD = "0776"
+# Админ ID
+ADMIN_IDS = [5286063642]  # ← Замени на свой Telegram ID
 
-# --- Инициализация базы данных ---
-def create_tables():
-    conn = sqlite3.connect('materials.db')
-    c = conn.cursor()
-    # Таблица категорий
-    c.execute('''CREATE TABLE IF NOT EXISTS categories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL)''')
-    # Таблица подкатегорий
-    c.execute('''CREATE TABLE IF NOT EXISTS subcategories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    category_id INTEGER NOT NULL,
-                    FOREIGN KEY(category_id) REFERENCES categories(id))''')
-    # Таблица материалов
-    c.execute('''CREATE TABLE IF NOT EXISTS materials (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    file_type TEXT,
-                    file_id TEXT NOT NULL,
-                    description TEXT,
-                    subcategory_id INTEGER NOT NULL,
-                    FOREIGN KEY(subcategory_id) REFERENCES subcategories(id))''')
-    conn.commit()
-    conn.close()
+# Инициализация базы
+def init_db():
+    with sqlite3.connect("materials.db") as conn:
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT)')
+        cur.execute('''CREATE TABLE IF NOT EXISTS subcategories (
+                        id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER)''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS materials (
+                        id INTEGER PRIMARY KEY, name TEXT, file_type TEXT,
+                        file_id TEXT, description TEXT, subcategory_id INTEGER)''')
+        conn.commit()
 
-# ===================== Пользовательский интерфейс =====================
+# Проверка админа
+def is_admin(user_id): return user_id in ADMIN_IDS
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Добро пожаловать! Выберите категорию:")
-    show_categories(update, context)
+# /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_categories(update, context)
 
+# Показывает категории
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with sqlite3.connect("materials.db") as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT id, name FROM categories')
+        cats = cur.fetchall()
 
-def show_categories(update: Update, context: CallbackContext):
-    conn = sqlite3.connect('materials.db')
-    c = conn.cursor()
-    c.execute('SELECT id, name FROM categories')
-    categories = c.fetchall()
-    conn.close()
-    if not categories:
-        update.message.reply_text("Категории отсутствуют. Обратитесь к администратору.")
+    if not cats:
+        await update.message.reply_text("Категории отсутствуют.")
         return
-    keyboard = [[InlineKeyboardButton(cat[1], callback_data=f"category_{cat[0]}")] for cat in categories]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Выберите категорию:", reply_markup=reply_markup)
 
+    keyboard = [[InlineKeyboardButton(name, callback_data=f"cat_{id}")] for id, name in cats]
+    await update.message.reply_text("Выберите категорию:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-def show_subcategories(update: Update, context: CallbackContext):
+# Подкатегории
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.data == "back_to_categories":
-        query.edit_message_text("Выберите категорию:")
-        show_categories(update, context)
-        return
-    category_id = query.data.split('_')[1]
-    context.user_data['category_id'] = category_id
-    conn = sqlite3.connect('materials.db')
-    c = conn.cursor()
-    c.execute('SELECT id, name FROM subcategories WHERE category_id = ?', (category_id,))
-    subcats = c.fetchall()
-    conn.close()
-    if not subcats:
-        query.edit_message_text("В этой категории отсутствуют подкатегории.")
-        return
-    keyboard = [[InlineKeyboardButton(sc[1], callback_data=f"subcategory_{sc[0]}")] for sc in subcats]
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_categories")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    query.edit_message_text("Выберите подкатегорию:", reply_markup=reply_markup)
+    data = query.data
+    await query.answer()
 
+    if data.startswith("cat_"):
+        cat_id = int(data.split("_")[1])
+        context.user_data["cat_id"] = cat_id
+        with sqlite3.connect("materials.db") as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT id, name FROM subcategories WHERE category_id=?', (cat_id,))
+            subs = cur.fetchall()
 
-def show_materials(update: Update, context: CallbackContext):
+        if not subs:
+            await query.edit_message_text("Подкатегории отсутствуют.")
+            return
+
+        keyboard = [[InlineKeyboardButton(name, callback_data=f"sub_{id}")] for id, name in subs]
+        await query.edit_message_text("Выберите подкатегорию:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("sub_"):
+        sub_id = int(data.split("_")[1])
+        with sqlite3.connect("materials.db") as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT name, file_type, file_id, description FROM materials WHERE subcategory_id=?', (sub_id,))
+            materials = cur.fetchall()
+
+        if not materials:
+            await query.edit_message_text("Материалы отсутствуют.")
+            return
+
+        text = "\n\n".join(f"📄 {m[0]} — {m[3]}" for m in materials)
+        await query.edit_message_text(f"Материалы:\n\n{text}")
+
+# Панель администратора
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("У вас нет доступа.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Категория", callback_data="add_category")],
+        [InlineKeyboardButton("➕ Подкатегория", callback_data="add_subcategory")],
+        [InlineKeyboardButton("📤 Загрузить файл", callback_data="upload_material")]
+    ]
+    await update.message.reply_text("Админ-панель:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# Добавление категории
+async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.data == "back_to_subcategories":
-        show_subcategories(update, context)
+    await query.answer()
+    data = query.data
+
+    if data == "add_category":
+        await query.edit_message_text("Введите название категории:")
+        context.user_data["admin_action"] = "add_category"
+    elif data == "add_subcategory":
+        await query.edit_message_text("Введите название подкатегории:")
+        context.user_data["admin_action"] = "add_subcategory"
+    elif data == "upload_material":
+        await query.edit_message_text("Отправьте файл с подписью: название | описание")
+        context.user_data["admin_action"] = "upload_material"
+
+# Обработка текстов от админа
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    subcat_id = query.data.split('_')[1]
-    context.user_data['subcategory_id'] = subcat_id
-    conn = sqlite3.connect('materials.db')
-    c = conn.cursor()
-    c.execute(
-        'SELECT name, file_type, file_id, description FROM materials WHERE subcategory_id = ?',
-        (subcat_id,)
-    )
-    materials = c.fetchall()
-    conn.close()
-    if not materials:
-        query.edit_message_text("В подкатегории пока нет материалов.")
-        return
-    text = "Материалы:\n\n"
-    keyboard = []
-    for mat in materials:
-        text += f"📄 {mat[0]}\n📝 {mat[3] or 'Без описания'}\n\n"
-        keyboard.append([InlineKeyboardButton(mat[0], callback_data=f"get_{mat[1]}_{mat[2]}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_subcategories")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    query.edit_message_text(text=text, reply_markup=reply_markup)
 
+    action = context.user_data.get("admin_action")
+    text = update.message.text
 
-def handle_download_request(update: Update, context: CallbackContext):
-    query = update.callback_query
-    try:
-        _, file_type, file_id = query.data.split('_', 2)
-    except ValueError:
-        query.answer("Неверный запрос!")
-        return
-    chat_id = query.message.chat.id
-    if file_type == "document":
-        context.bot.send_document(chat_id=chat_id, document=file_id)
-    elif file_type == "photo":
-        context.bot.send_photo(chat_id=chat_id, photo=file_id)
-    elif file_type == "video":
-        context.bot.send_video(chat_id=chat_id, video=file_id)
-    query.answer("Отправлено!")
-
-# ===================== Административные функции =====================
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-# ...остальные админ функции остаются без изменений...
-
-# ===================== Обработка загрузки файлов =====================
-
-def handle_document_upload(update: Update, context: CallbackContext):
-    if context.user_data.get('admin_action') != 'material_file':
-        return
-    file_type, file_id = None, None
-    if update.message.document:
-        file_type = 'document'
-        file_id = update.message.document.file_id
-    elif update.message.photo:
-        file_type = 'photo'
-        file_id = update.message.photo[-1].file_id
-    elif update.message.video:
-        file_type = 'video'
-        file_id = update.message.video.file_id
-    else:
-        update.message.reply_text('Файл не распознан. Попробуйте снова.')
-        return
-    subcat_id = context.user_data.get('subcategory_id')
-    name = context.user_data.get('material_name')
-    description = context.user_data.get('material_desc')
-    conn = sqlite3.connect('materials.db')
-    c = conn.cursor()
-    c.execute(
-        'INSERT INTO materials (name, file_type, file_id, description, subcategory_id) VALUES (?, ?, ?, ?, ?)',
-        (name, file_type, file_id, description, subcat_id)
-    )
-    conn.commit()
-    conn.close()
-    update.message.reply_text('Материал успешно загружен.')
+    if action == "add_category":
+        with sqlite3.connect("materials.db") as conn:
+            conn.execute("INSERT INTO categories(name) VALUES(?)", (text,))
+        await update.message.reply_text(f"Категория '{text}' добавлена.")
+    elif action == "add_subcategory":
+        cat_id = context.user_data.get("cat_id")
+        if not cat_id:
+            await update.message.reply_text("Сначала выберите категорию (/start).")
+            return
+        with sqlite3.connect("materials.db") as conn:
+            conn.execute("INSERT INTO subcategories(name, category_id) VALUES(?,?)", (text, cat_id))
+        await update.message.reply_text(f"Подкатегория '{text}' добавлена.")
     context.user_data.clear()
 
-# ===================== Запуск бота =====================
+# Загрузка материалов
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
 
+    action = context.user_data.get("admin_action")
+    if action != "upload_material":
+        return
+
+    caption = update.message.caption
+    if not caption or "|" not in caption:
+        await update.message.reply_text("Добавьте название и описание через |")
+        return
+
+    name, description = [c.strip() for c in caption.split("|", 1)]
+    file_id = update.message.document.file_id
+    file_type = "document"
+    sub_id = context.user_data.get("sub_id")
+
+    if not sub_id:
+        await update.message.reply_text("Сначала выберите подкатегорию.")
+        return
+
+    with sqlite3.connect("materials.db") as conn:
+        conn.execute(
+            "INSERT INTO materials(name, file_type, file_id, description, subcategory_id) VALUES(?,?,?,?,?)",
+            (name, file_type, file_id, description, sub_id)
+        )
+    await update.message.reply_text("Файл загружен.")
+    context.user_data.clear()
+
+# Запуск
 def main():
-    create_tables()
-    updater = Updater("8029940673:AAEjVG8sEPsw4G7EROviyhcpQtjSfPkPDCU", use_context=True)
-    dp = updater.dispatcher
+    init_db()
+    app = Application.builder().token("YOUR_BOT_TOKEN").build()
 
-    # Команды
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CommandHandler('admin', show_admin_menu))
-    # CallbackQuery для inline кнопок
-    dp.add_handler(CallbackQueryHandler(button_handler))
-    # Текстовые сообщения для админ-операций
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=ADMIN_IDS), admin_text_handler))
-    # Загрузка файлов админом
-    dp.add_handler(MessageHandler(
-        (Filters.document | Filters.photo | Filters.video) &
-        Filters.user(user_id=ADMIN_IDS),
-        handle_document_upload
-    ))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(CallbackQueryHandler(admin_button, pattern="^(add_category|add_subcategory|upload_material)$"))
+    app.add_handler(MessageHandler(filters.TEXT & filters.USER(ADMIN_IDS), handle_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Запуск polling
-    updater.start_polling()
-    updater.idle()
+    app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+
